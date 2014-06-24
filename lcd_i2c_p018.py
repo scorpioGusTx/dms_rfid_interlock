@@ -2,7 +2,7 @@
 from Adafruit_I2C import Adafruit_I2C as i2c
 import Queue, threading, time
 
-class lcd_i2c_p018:
+class lcd:
 
 	columns = 16
 	rows =     2
