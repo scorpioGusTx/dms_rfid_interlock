@@ -121,7 +121,7 @@ class rfid_reader(threading.Thread):
     white circle:   12885801092
     white rectangle 25779665946
     """
-    def __init__(self, rfid_config, tool_id, action_queue):
+    def __init__(self, rfid_config, tool_id, query_url, action_queue):
         log = logging.getLogger("rfid_reader.init")
         log.info("tool_id is " + tool_id)
         #
@@ -133,6 +133,7 @@ class rfid_reader(threading.Thread):
 
         threading.Thread.__init__(self)
         self.tool_id      = tool_id
+        self.query_url    = query_url
         self.action_queue = action_queue
 
         #
@@ -242,6 +243,7 @@ class rfid_reader(threading.Thread):
                         "r=api/toolValidate",
                         "&badge=" + badge_decimal,
                         "&tool=" + self.tool_id ])
+                    url = self.query_url.format(tool_id = self.tool_id, badge_id = badge_decimal)
                     log_makermanager.info("rfid_reader.run(): sent: " + url)
                     json_response = urllib2.urlopen(url).readline()
                     log_makermanager.info("rfid_reader.run(): got: " + 
@@ -275,10 +277,10 @@ class serial_rfid_reader(rfid_reader):
     """
     serial rfid_reader
     """
-    def __init__(self, rfid_config, connection, tool_id, action_queue):
+    def __init__(self, rfid_config, connection, tool_id, query_url, action_queue):
         log = logging.getLogger("serial_rfid_reader.init")
         log.info("in serial_rfid_reader.__init__()")
-        rfid_reader.__init__(self, rfid_config, tool_id, action_queue)
+        rfid_reader.__init__(self, rfid_config, tool_id, query_url, action_queue)
         if 'baud' in rfid_config:
             self.input = serial.Serial(connection, rfid_config['baud'])
         else:
@@ -291,12 +293,12 @@ class serial_rfid_reader(rfid_reader):
 ################################################################################
 
 class keyboard_rfid_reader(rfid_reader):
-    def __init__(self, rfid_config, connection, tool_id, action_queue):
+    def __init__(self, rfid_config, connection, tool_id, query_url, action_queue):
         log = logging.getLogger("keyboard_rfid_reader.init")
         log.info("in keyboard_rfid_reader.__init__()")
         #
         # may need to pass connection into the parent __init__
-        rfid_reader.__init__(self, rfid_config, tool_id, action_queue)
+        rfid_reader.__init__(self, rfid_config, tool_id, query_url, action_queue)
         if connection == "stdin":
             self.input = sys.stdin
         else:
@@ -335,10 +337,10 @@ class input_event_stream:
         return line
 
 class input_event_rfid_reader(rfid_reader):
-    def __init__(self, rfid_config, connection, tool_id, action_queue):
+    def __init__(self, rfid_config, connection, tool_id, query_url, action_queue):
         log = logging.getLogger("input_event_rfid_reader.init")
         log.info("in input_event_rfid_reader.__init__()")
-        rfid_reader.__init__(self, rfid_config, tool_id, action_queue)
+        rfid_reader.__init__(self, rfid_config, tool_id, query_url, action_queue)
         self.input = input_event_stream(connection)
 
 ################################################################################
@@ -918,52 +920,97 @@ class adc_monitor(threading.Thread):
 
 
 class heartbeat(threading.Thread):
-    def __init__(self):
-        error_maintenance = False
-        error_network = False
+    modes_to_remember = [
+        ACTIVE,
+        INACTIVE_SOON,
+        INACTIVE,
+        ERROR,
+        ERROR_CONFIG,
+        ERROR_NETWORK,
+        ERROR_MAINTENANCE
+    ]
+    modes_to_check_makermanger = [
+        INACTIVE, 
+        ERROR, 
+        ERROR_NETWORK, 
+        ERROR_MAINTENANCE
+    ]
+
+    def __init__(self, query_url, action_queue):
+        threading.Thread.__init__(self)
+
+        self.current_mode = POWER_UP
+        self.query_url    = query_url
+        self.action_queue = action_queue
 
     def update(self, new_status):
-        pass
-        # POWER_UP
-        # ACTIVE
-        # INACTIVE_SOON
-        # INACTIVE
-        # ERROR
-        # ERROR_CONFIG
-        # ERROR_NETWORK
-        # ERROR_MAINTENANCE
-
-        # TESTING_NETWORK
-        # CHECKING_BADGE
-        # LOGIN_DENIED
+        if new_status in self.modes_to_remember:
+            self.current_mode = new_status
 
     def run(self):
         log = logging.getLogger("heartbeat.run")
         log.info("start")
 
-        #
-        # check the makermanager
-        #
-        try:
-            url = ''.join([
-               "https://dallasmakerspace.org/makermanager/index.php?",
-               "r=api/toolValidate&badge&tool" ])
-            log.info("heartbeat.run(): sent: " + url)
-            json_response = urllib2.urlopen(url).readline()
-            log.info("heartbeat.run(): got: " + json_response)
-            response = json.loads(json_response)
-        except ValueError, e:
-            self.action_queue.put((ERROR_NETWORK, "heartbeat: makermanager is not returning valid JSON"))
-            log.error("Makermanager is not returning valid JSON")
-        except urllib2.HTTPError, e:
-            self.action_queue.put((ERROR_NETWORK, "heartbeat: Cannot contact makermanager (HTTP)"))
-            log.error("Cannot contact makermanager (HTTP)")
-        except urllib2.URLError, e:
-            self.action_queue.put((ERROR_NETWORK, "heartbeat: Cannot contact makermanager (URL)"))
+        while True:
+            if self.current_mode in self.modes_to_check_makermanger:
+                errors = []
+                errors_source = {}
+                #
+                # check the makermanager
+                #
+                try:
+                    url = self.query_url.format(tool_id = "", badge_id = "")
+                    log.info("heartbeat.run(): sent: " + url)
+                    json_response = urllib2.urlopen(url).readline()
+                    log.info("heartbeat.run(): got: " + json_response)
+                    response = json.loads(json_response)
 
-        #
-        # check the maintenance status
-        #
+                except ValueError, e:
+                    errors += [ ERROR_NETWORK ]
+                    errors_source[ERROR_NETWORK] = "heartbeat.run(): makermanager is not returning valid JSON"
+                    log.error("Makermanager is not returning valid JSON")
+
+                except urllib2.HTTPError, e:
+                    errors += [ ERROR_NETWORK ]
+                    errors_source[ERROR_NETWORK] = "heartbeat.run(): Cannot contact makermanager (HTTP)"
+                    log.error("Cannot contact makermanager (HTTP)")
+
+                except urllib2.URLError, e:
+                    errors += [ ERROR_NETWORK ]
+                    errors_source[ERROR_NETWORK] = "heartbeat.run(): Cannot contact makermanager (URL)"
+                    log.error("Cannot contact makermanager (URL)")
+
+                #
+                # check the maintenance status
+                #
+
+                #
+                # update status as necessary
+                #
+                if not errors:
+                    if self.current_mode != INACTIVE:
+                        #
+                        # no longer have errors, let everyone know !
+                        #
+                        self.action_queue.put((INACTIVE, "heartbeat.run(): found network"))
+                    #
+                    # no problems, lets check again in 30 seconds so as not to
+                    # irritate the server too much
+                    #
+                    time.sleep(30)
+                elif self.current_mode not in errors:
+                    #
+                    # if the current error state is not in the current list of 
+                    # errors then make take the first error
+                    #
+                    use_error = errors[0]
+                    self.action_queue.put((use_error, errors_source[use_error]))
+                    time.sleep(1)
+            else:
+                #
+                # we're busy doing stuff, no point checking the network connection
+                #
+                time.sleep(.5)
 
 ################################################################################
 #
@@ -1018,6 +1065,14 @@ class interlock(threading.Thread):
             self.tool_id = interlock_config['tool_id']
 
         #
+        # get the query url
+        #
+        if interlock_config['query_url'] == "":
+            self.query_url = "http://127.0.0.1/validate?badge_id={badge_id}&tool_id={tool_id}"
+            log.error("query_url missing from config")
+        else:
+            self.query_url = interlock_config['query_url']
+        #
         # process what to do when triggers occur
         #
         output_mapping = {
@@ -1068,7 +1123,7 @@ class interlock(threading.Thread):
         for connection, rfid_config in rfid_configs.items():
             try:
                 reader = rfid_reader_mapping[rfid_config['type']](
-                        rfid_config, connection, self.tool_id, self.action_queue)
+                        rfid_config, connection, self.tool_id, self.query_url, self.action_queue)
                 reader.start()
                 self.rfid_readers.append(reader)
                 log.info("rfid_reader " + connection + " added")
@@ -1102,7 +1157,16 @@ class interlock(threading.Thread):
             except KeyError, e:
                 log.error("monitor " + connection + " could not be added " + str(e))
 
-        self.need_status_updates = self.outputs + self.rfid_readers
+        #
+        # set up the task that monitors network connection and tool status
+        #
+        self.heartbeat = heartbeat(self.query_url, self.action_queue)
+        self.heartbeat.start()
+
+        #
+        # the list of objects that receive update messages
+        #
+        self.need_status_updates = self.outputs + self.rfid_readers + [ self.heartbeat ]
 
     def run(self):
         log = logging.getLogger("interlock.run")
@@ -1260,5 +1324,3 @@ if __name__ == "__main__":
     else:
         time.sleep(2)
         interlock.start()
-        heartbeat = heartbeat()
-        heartbeat.run()
