@@ -51,6 +51,7 @@ CHECKING_BADGE    = "checking_badge"
 LOGIN_DENIED      = "login_denied"
 
 RESET_TIMER       = "reset_timer"
+TERMINATE         = "terminate"
 
 INTERLOCK_STATES = [
     POWER_UP,
@@ -72,7 +73,7 @@ INTERLOCK_INFO_ONLY = [
     LOGIN_DENIED
 ]
 
-INTERLOCK_MESSAGES = INTERLOCK_STATES + [ RESET_TIMER ]
+INTERLOCK_MESSAGES = INTERLOCK_STATES + [ RESET_TIMER , TERMINATE ]
 
 ################################################################################
 #
@@ -91,6 +92,7 @@ class ErrorArrayHandler(logging.Handler):
     def __init__(self):
         logging.Handler.__init__(self)
         self.clear_errors()
+        self.errors = []
 
     def emit(self, record):
         self.errors.append(record)
@@ -103,11 +105,11 @@ class ErrorArrayHandler(logging.Handler):
 
 ################################################################################
 #
-#  generic rfid_reader
+#  generic BadgeReader
 #
 ################################################################################
 
-class rfid_reader(threading.Thread):
+class BadgeReader(threading.Thread):
     """ 
     an object which hides the details of the rfid reader.
     As long as read() is provided, its all good. 
@@ -122,7 +124,7 @@ class rfid_reader(threading.Thread):
     white rectangle 25779665946
     """
     def __init__(self, rfid_config, tool_id, query_url, action_queue):
-        log = logging.getLogger("rfid_reader.init")
+        log = logging.getLogger("BadgeReader.init")
         log.info("tool_id is " + tool_id)
         #
         # Help adapt to understand the rfid code
@@ -144,7 +146,7 @@ class rfid_reader(threading.Thread):
         self.last_status = None
 
     def translate_test(self, badge_decimal):
-        log= logging.getLogger("rfid_reader.translate")
+        log = logging.getLogger("BadgeReader.translate")
         log.info("in translate_test()")
 
         badge_translation = {
@@ -178,24 +180,24 @@ class rfid_reader(threading.Thread):
 
     def run(self):
         """ 
-        tells the interlock when we scan a badge indicating a person has 
+        tells the Interlock when we scan a badge indicating a person has 
         permission to use this equipment
         """
 
-        log_run = logging.getLogger("rfid_reader.run")
-        log_read = logging.getLogger("rfid_reader.read")
-        log_throttle = logging.getLogger("rfid_reader.throttle")
-        log_code = logging.getLogger("rfid_reader.code")
-        log_makermanager = logging.getLogger("rfid_reader.makermanager")
+        log_run = logging.getLogger("BadgeReader.run")
+        log_read = logging.getLogger("BadgeReader.read")
+        log_throttle = logging.getLogger("BadgeReader.throttle")
+        log_code = logging.getLogger("BadgeReader.code")
+        log_makermanager = logging.getLogger("BadgeReader.makermanager")
 
-        log_run.info("in rfid_reader.run()")
+        log_run.info("in BadgeReader.run()")
 
-        ignore_scan_period = timedelta(seconds = 3)
+        ignore_scan_period = timedelta(seconds = 1)
 
         while True:
             badge_raw = self.input.readline().rstrip()
             log_read.info("read in badge '" + badge_raw + "'")
-            self.action_queue.put((CHECKING_BADGE, "rfid_reader.run()") )
+            self.action_queue.put((CHECKING_BADGE, "BadgeReader.run()") )
 
             #
             # delete old scans
@@ -215,7 +217,7 @@ class rfid_reader(threading.Thread):
             log_throttle.debug("checking for " + badge_raw + " in " + 
                     str(self.ignore_for_now))
             if badge_raw in self.ignore_for_now:
-                if badge_raw <> "":
+                if badge_raw != "":
                     log_throttle.debug("ignoring " + badge_raw + " for now")
                     badge_raw = ""
             else:
@@ -227,60 +229,64 @@ class rfid_reader(threading.Thread):
             #
             # let's check to see if we have an authorized badge
             #
-            if (badge_raw <> ""):
-                try:
-                    badge_raw = badge_raw[self.code_skip_chars: self.code_len]; # drop the checksum
-                    badge_decimal = str(int(badge_raw, self.code_base)) 
-                    log_code.info("rfid_reader.run(): badge code is " + 
-                                str(badge_decimal))
-                    #
-                    # translate
-                    #
-                    badge_decimal = self.translate_test(badge_decimal)
+            if (badge_raw != ""):
+                if self.last_status == ACTIVE:
+                    self.action_queue.put((INACTIVE, "BadgeReader.run() swipe out"))
+                else:
+                    try:
+                        badge_raw = badge_raw[self.code_skip_chars: self.code_len] # drop the checksum
+                        badge_decimal = str(int(badge_raw, self.code_base)) 
+                        log_code.info("BadgeReader.run(): badge code is " + 
+                                    str(badge_decimal))
+                        #
+                        # translate
+                        #
+                        badge_decimal = self.translate_test(badge_decimal)
 
-                    url = ''.join([
-                        "https://dallasmakerspace.org/makermanager/index.php?",
-                        "r=api/toolValidate",
-                        "&badge=" + badge_decimal,
-                        "&tool=" + self.tool_id ])
-                    url = self.query_url.format(tool_id = self.tool_id, badge_id = badge_decimal)
-                    log_makermanager.info("rfid_reader.run(): sent: " + url)
-                    json_response = urllib2.urlopen(url).readline()
-                    log_makermanager.info("rfid_reader.run(): got: " + 
-                            json_response)
+                        url = ''.join([
+                            "https://dallasmakerspace.org/makermanager/index.php?",
+                            "r=api/toolValidate",
+                            "&badge=" + badge_decimal,
+                            "&tool=" + self.tool_id ])
+                        url = self.query_url.format(tool_id = self.tool_id, badge_id = badge_decimal)
+                        log_makermanager.info("BadgeReader.run(): sent: " + url)
+                        json_response = urllib2.urlopen(url).readline()
+                        log_makermanager.info("BadgeReader.run(): got: " + 
+                                json_response)
 
-                    if json_response <> "":
-                        response = json.loads(json_response)
-                        if response['authorized'] == True:
-                            if str(response['machine_id']) == self.tool_id:
-                                self.action_queue.put((ACTIVE, "rfid_reader.run()"))
-                        else:
-                            self.action_queue.put((LOGIN_DENIED, "rfid_reader.run()") )
-                except ValueError, e:
-                    log_read.error("Cannot convert " + badge_raw + " into decimal")
-                except urllib2.HTTPError, e:
-                    self.action_queue.put((ERROR_NETWORK, "rfid_reader: Cannot contact makermanager (HTTP)"))
-                    log_run.error("Cannot contact makermanager (HTTP)")
-                except urllib2.URLError, e:
-                    self.action_queue.put((ERROR_NETWORK, "rfid_reader: Cannot contact makermanager (URL)"))
+                        if json_response != "":
+                            response = json.loads(json_response)
+                            if response['authorized'] == True:
+                                if str(response['machine_id']) == self.tool_id:
+                                    self.action_queue.put((ACTIVE, "BadgeReader.run()"))
+                            else:
+                                self.action_queue.put((LOGIN_DENIED, "BadgeReader.run()") )
+                    except ValueError:
+                        log_read.error("Cannot convert " + badge_raw + " into decimal")
+                    except urllib2.HTTPError:
+                        self.action_queue.put((ERROR_NETWORK, "BadgeReader: Cannot contact makermanager (HTTP)"))
+                        log_run.error("Cannot contact makermanager (HTTP)")
+                    except urllib2.URLError:
+                        self.action_queue.put((ERROR_NETWORK, "BadgeReader: Cannot contact makermanager (URL)"))
 
     def update(self, status):
-        log_update = logging.getLogger("rfid_reader.update")
-        if self.last_status <> status:
+        log_update = logging.getLogger("BadgeReader.update")
+        if self.last_status != status:
             self.ignore_for_now.clear()
-            self.last_status = status
-            log_update.info("rfid_reader.update():" + 
+            log_update.info("BadgeReader.update():" + 
                         " status changed, clearing rfid cache")
+            if status in [ACTIVE, INACTIVE]:
+                self.last_status = status
 
 
-class serial_rfid_reader(rfid_reader):
+class BadgeReaderSerial(BadgeReader):
     """
-    serial rfid_reader
+    serial BadgeReader
     """
     def __init__(self, rfid_config, connection, tool_id, query_url, action_queue):
-        log = logging.getLogger("serial_rfid_reader.init")
-        log.info("in serial_rfid_reader.__init__()")
-        rfid_reader.__init__(self, rfid_config, tool_id, query_url, action_queue)
+        log = logging.getLogger("BadgeReaderSerial.init")
+        log.info("in BadgeReaderSerial.__init__()")
+        BadgeReader.__init__(self, rfid_config, tool_id, query_url, action_queue)
         if 'baud' in rfid_config:
             self.input = serial.Serial(connection, rfid_config['baud'])
         else:
@@ -288,17 +294,17 @@ class serial_rfid_reader(rfid_reader):
 
 ################################################################################
 #
-#  stdin rfid_reader
+#  stdin BadgeReader
 #
 ################################################################################
 
-class keyboard_rfid_reader(rfid_reader):
+class BadgeReaderKeyboard(BadgeReader):
     def __init__(self, rfid_config, connection, tool_id, query_url, action_queue):
-        log = logging.getLogger("keyboard_rfid_reader.init")
-        log.info("in keyboard_rfid_reader.__init__()")
+        log = logging.getLogger("BadgeReaderKeyboard.init")
+        log.info("in BadgeReaderKeyboard.__init__()")
         #
         # may need to pass connection into the parent __init__
-        rfid_reader.__init__(self, rfid_config, tool_id, query_url, action_queue)
+        BadgeReader.__init__(self, rfid_config, tool_id, query_url, action_queue)
         if connection == "stdin":
             self.input = sys.stdin
         else:
@@ -306,25 +312,25 @@ class keyboard_rfid_reader(rfid_reader):
 
 ################################################################################
 #
-#  input_event rfid_reader
+#  input_event BadgeReader
 #
 ################################################################################
 
-class input_event_stream:
+class InputEventStream:
     """
     This class provides a stream like interface into a device file that only
     responds to input event calls
     """
     def __init__(self, device_filename, scan_to_char = None):
-        log = logging.getLogger("input_event_rfid_reader.init")
+        log = logging.getLogger("BadgeReaderInputEvent.init")
         try:
             self.device = InputDevice(device_filename)
         except OSError:
             log.error("cannot open " + device_filename)
-            throw
+            raise
 
         default_scan_to_char = ["", ""] + [str(x) for x in range(1, 10)] + ['0'] + ([""] * 16) + ["\n"] + [""] * 100
-        self.scan_to_char = scan_to_char if scan_to_char <> None else default_scan_to_char
+        self.scan_to_char = scan_to_char if scan_to_char != None else default_scan_to_char
 
     def readline(self):
         line = ""
@@ -336,20 +342,20 @@ class input_event_stream:
                     line += self.scan_to_char[event.code]
         return line
 
-class input_event_rfid_reader(rfid_reader):
+class BadgeReaderInputEvent(BadgeReader):
     def __init__(self, rfid_config, connection, tool_id, query_url, action_queue):
-        log = logging.getLogger("input_event_rfid_reader.init")
-        log.info("in input_event_rfid_reader.__init__()")
-        rfid_reader.__init__(self, rfid_config, tool_id, query_url, action_queue)
-        self.input = input_event_stream(connection)
+        log = logging.getLogger("BadgeReaderInputEvent.init")
+        log.info("in BadgeReaderInputEvent.__init__()")
+        BadgeReader.__init__(self, rfid_config, tool_id, query_url, action_queue)
+        self.input = InputEventStream(connection)
 
 ################################################################################
 #
-#  generic output controls
+#  generic Output controls
 #
 ################################################################################
 
-class status_indicator:
+class Output:
     """ 
     a generic status indicator, 
     providing base functionality regardless of the output
@@ -366,12 +372,14 @@ class status_indicator:
 
 ################################################################################
 #
-#  digital gpio status_indicator
+#  digital gpio Output
 #
 ################################################################################
 
-class lcd_p018_output(status_indicator, threading.Thread):
+class OutputLcdP018(Output, threading.Thread):
     def __init__(self, connection_config, connection):
+        threading.Thread.__init__(self)
+
         log = logging.getLogger("lcd_p018_output.init")
         log.info("creating: " + connection)
         self.mode = None
@@ -379,7 +387,6 @@ class lcd_p018_output(status_indicator, threading.Thread):
         self.timer = None
         self.saved_status = None
 
-        connection_parts = connection.split(":")
         error_prefix =  connection + ": "
 
         if connection not in ("i2c:0:x38", "i2c:1:x38", "i2c:0:0x38", "i2c:1:0x38"):
@@ -423,10 +430,13 @@ class lcd_p018_output(status_indicator, threading.Thread):
                 }
                 if 'message' not in state_config:
                     log.error(error_prefix + "message: missing")
-                elif (type(state_config['message']) <> list or 
-                        len(state_config['message']) != 2 or
-                        len([ len(message) for message in state_config['message'] if len(message) > self.lcd.columns ]) > 0):
-                    log.error(error_prefix + "message: needs to be an array of 2 strings of " + self.lcd.columns + " characters")
+                elif (type(state_config['message']) != list or 
+                        len(state_config['message']) != self.lcd.rows or
+                        len([ len(message) 
+                              for message in state_config['message'] 
+                              if len(message) != self.lcd.columns ]) > 0):
+                    log.error(error_prefix + "message: needs to be an array of " + str(self.lcd.rows) + 
+                            " strings of " + str(self.lcd.columns) + " characters")
                 else:
                     action["message"] = state_config['message']
 
@@ -435,9 +445,9 @@ class lcd_p018_output(status_indicator, threading.Thread):
                 #
                 if 'color' not in state_config:
                     log.error(error_prefix + "color: missing")
-                elif (type(state_config['color']) <> list or
-                        len(state_config['color']) <> 3 or
-                        len([ elment for element in state_config['color'] if type(element) not in (int, float) ]) or
+                elif (type(state_config['color']) != list or
+                        len(state_config['color']) != 3 or
+                        len([ element for element in state_config['color'] if type(element) not in (int, float) ]) or
                         len([ number for number in state_config['color'] if number > 255 or number < 0 ]) ):
                     log.error(error_prefix + "message: needs to be a tuple of 3 numbers between 0 and 255")
                 else:
@@ -488,7 +498,7 @@ class lcd_p018_output(status_indicator, threading.Thread):
 
             self.lcd.show_rgb(action['message'], action['color'])
 
-            if self.timer <> None:
+            if self.timer != None:
                 self.timer.cancel()
 
             if action['timeout']:
@@ -510,16 +520,18 @@ class lcd_p018_output(status_indicator, threading.Thread):
 
 ################################################################################
 #
-#  digital gpio status_indicator
+#  digital gpio Output
 #
 ################################################################################
 
-class digital_output(status_indicator, threading.Thread):
+class OutputDigital(Output, threading.Thread):
     """ 
     control the works with digital output
     """
 
     def __init__(self, connection_config, connection):
+        threading.Thread.__init__(self)
+
         log = logging.getLogger("digital_output.init")
         log.info("creating: " + connection)
 
@@ -534,11 +546,11 @@ class digital_output(status_indicator, threading.Thread):
         # do we want a GPIO.HIGH or GPIO.LOW to turn it "on"
         #
         if connection_config.get("on", "HIGH") == "LOW":
-            self.ON = GPIO.LOW
-            self.OFF = GPIO.HIGH
+            self.on = GPIO.LOW
+            self.off = GPIO.HIGH
         else:
-            self.ON = GPIO.HIGH
-            self.OFF = GPIO.LOW
+            self.on = GPIO.HIGH
+            self.off = GPIO.LOW
 
         #
         # put one level lower ?
@@ -652,7 +664,7 @@ class digital_output(status_indicator, threading.Thread):
 
             function = action['function']
             parameter = action['parameter']
-            if parameter <> None:
+            if parameter != None:
                 function(parameter)
             else:
                 function()
@@ -669,12 +681,12 @@ class digital_output(status_indicator, threading.Thread):
         log.info(self.control_pin + ": seconds: " + str(seconds))
         self.clear_threads()
         if seconds == None:
-            GPIO.output(self.control_pin, self.ON)
+            GPIO.output(self.control_pin, self.on)
             self.timer = None
         else:
-            GPIO.output(self.control_pin, self.ON)
+            GPIO.output(self.control_pin, self.on)
             self.timer = threading.Timer(seconds, self.turn_off)
-            # lambda: GPIO.output(self.control_pin, self.OFF))
+            # lambda: GPIO.output(self.control_pin, self.off))
             log.debug(self.control_pin + ": starting timer")
             self.timer.start()
 
@@ -683,7 +695,7 @@ class digital_output(status_indicator, threading.Thread):
         log.info(self.control_pin + ": (" + str(seconds) + ")")
         self.clear_threads()
         if seconds == None:
-            GPIO.output(self.control_pin, self.OFF)
+            GPIO.output(self.control_pin, self.off)
         else:
             self.timer = threading.Timer(seconds, self.turn_on)
             log.debug(self.control_pin + ": starting timer")
@@ -702,7 +714,6 @@ class digital_output(status_indicator, threading.Thread):
         log.info(self.control_pin + ": (" + str(seconds) + ")")
         self.clear_threads()
         self.blink_time = "sos"
-        threading.Thread.__init__(self)
         self.start()
 
     def run(self):
@@ -711,7 +722,7 @@ class digital_output(status_indicator, threading.Thread):
         """
         log = logging.getLogger("digital_output.run")
         log.info(self.control_pin + ": (" + str(self.blink_time) + ")")
-        while self.blink_time <> None:
+        while self.blink_time != None:
             if self.blink_time == "sos":
                 self.run_sos()
             else:
@@ -721,9 +732,9 @@ class digital_output(status_indicator, threading.Thread):
         log = logging.getLogger("digital_output.blink")
         log.info(self.control_pin + ": cycle time: " + str(self.blink_time))
         blink_high = True
-        while self.blink_time <> None:
+        while self.blink_time != None:
             GPIO.output(self.control_pin, 
-                    {True: self.ON, False: self.OFF}[blink_high])
+                    {True: self.on, False: self.off}[blink_high])
             blink_high = not(blink_high)
             time.sleep(self.blink_time)
 
@@ -731,23 +742,23 @@ class digital_output(status_indicator, threading.Thread):
         log = logging.getLogger("digital_output.sos")
         log.info(self.control_pin)
         sequence = [
-                (.3, self.ON), (.3, self.OFF),
-                (.3, self.ON), (.3, self.OFF),
-                (.3, self.ON),
+                (.3, self.on), (.3, self.off),
+                (.3, self.on), (.3, self.off),
+                (.3, self.on),
                 
-                (1, self.OFF),
+                (1, self.off),
 
-                (1, self.ON), (.3, self.OFF),
-                (1, self.ON), (.3, self.OFF),
-                (1, self.ON),
+                (1, self.on), (.3, self.off),
+                (1, self.on), (.3, self.off),
+                (1, self.on),
 
-                (1, self.OFF),
+                (1, self.off),
 
-                (.3, self.ON), (.3, self.OFF),
-                (.3, self.ON), (.3, self.OFF),
-                (.3, self.ON),
+                (.3, self.on), (.3, self.off),
+                (.3, self.on), (.3, self.off),
+                (.3, self.on),
 
-                (2, self.OFF),
+                (2, self.off),
         ]
 
         index = 0
@@ -760,17 +771,17 @@ class digital_output(status_indicator, threading.Thread):
             index = 0 if index >= len(sequence) else index
 
     def clear_threads(self):
-        if self.timer <> None:
+        if self.timer != None:
             self.timer.cancel()
         self.blink_time = None
 
 ################################################################################
 #
-#  stdio status_indicator
+#  stdio Output
 #
 ################################################################################
 
-class stdio_output(status_indicator):
+class OutputStdio(Output):
     """ 
     show our current state on stdout
     """
@@ -806,11 +817,11 @@ class stdio_output(status_indicator):
 
 ################################################################################
 #
-#  generic monitor
+#  generic Monitor
 #
 ################################################################################
 
-class monitor(threading.Thread):
+class Monitor(threading.Thread):
     def __init__(self, digital_config, action_queue):
         self.action_queue = action_queue
         threading.Thread.__init__(self)
@@ -818,14 +829,14 @@ class monitor(threading.Thread):
 
 ################################################################################
 #
-#  digital monitor
+#  digital Monitor
 #
 ################################################################################
-class digital_monitor(monitor):
+class MonitorDigital(Monitor):
     def __init__(self, digital_config, connection, action_queue):
         log = logging.getLogger("digital_monitor.init")
 
-        monitor.__init__(self, digital_config, action_queue)
+        Monitor.__init__(self, digital_config, action_queue)
 
         self.connection = connection
 
@@ -858,14 +869,14 @@ class digital_monitor(monitor):
                 self.action_queue.put(packet)
 
 
-###############################################################################e
+################################################################################
 #
-#  adc monitor
+#  adc Monitor
 #
 ################################################################################
-class adc_monitor(threading.Thread):
+class MonitorAnalog(Monitor):
     def __init__(self, adc_config, connection, action_queue):
-        monitor.__init__(self, digital_config, action_queue)
+        Monitor.__init__(self, adc_config, action_queue)
         self.connection = connection
 
         self.message_conditions = dict()
@@ -879,7 +890,9 @@ class adc_monitor(threading.Thread):
             for key in ['higher', 'lower']:
                 try:
                     conditions[key] = float(digital_config.get(key))
-                except keyValue, TypeError:
+                except KeyError:
+                    pass
+                except TypeError:
                     pass
 
             conditions['evaluate'] = "or"
@@ -895,9 +908,9 @@ class adc_monitor(threading.Thread):
         ADC.setup()
 
     def run(self):
-        trash = ADC.read(self.connection)
+        ADC.read(self.connection)
         while True:
-            sleep(.01)
+            time.sleep(.01)
             value = ADC.read(self.connection)
             for message, conditions in self.message_conditions.items():
                 if conditions['evaluate'] == "and":
@@ -916,10 +929,10 @@ class adc_monitor(threading.Thread):
                 self.action_queue.put((
                     message,
                     "digital_monitor: " + self.connection))
-                sleep(.5)
+                time.sleep(.5)
 
 
-class heartbeat(threading.Thread):
+class NetworkHeartbeatMonitor(threading.Thread):
     modes_to_remember = [
         ACTIVE,
         INACTIVE_SOON,
@@ -948,7 +961,7 @@ class heartbeat(threading.Thread):
             self.current_mode = new_status
 
     def run(self):
-        log = logging.getLogger("heartbeat.run")
+        log = logging.getLogger("NetworkHeartbeatMonitor.run")
         log.info("start")
 
         while True:
@@ -960,24 +973,24 @@ class heartbeat(threading.Thread):
                 #
                 try:
                     url = self.query_url.format(tool_id = "", badge_id = "")
-                    log.info("heartbeat.run(): sent: " + url)
+                    log.info("NetworkHeartbeatMonitor.run(): sent: " + url)
                     json_response = urllib2.urlopen(url).readline()
-                    log.info("heartbeat.run(): got: " + json_response)
-                    response = json.loads(json_response)
+                    log.info("NetworkHeartbeatMonitor.run(): got: " + json_response)
+                    json.loads(json_response)
 
-                except ValueError, e:
+                except ValueError:
                     errors += [ ERROR_NETWORK ]
-                    errors_source[ERROR_NETWORK] = "heartbeat.run(): makermanager is not returning valid JSON"
+                    errors_source[ERROR_NETWORK] = "NetworkHeartbeatMonitor.run(): makermanager is not returning valid JSON"
                     log.error("Makermanager is not returning valid JSON")
 
-                except urllib2.HTTPError, e:
+                except urllib2.HTTPError:
                     errors += [ ERROR_NETWORK ]
-                    errors_source[ERROR_NETWORK] = "heartbeat.run(): Cannot contact makermanager (HTTP)"
+                    errors_source[ERROR_NETWORK] = "NetworkHeartbeatMonitor.run(): Cannot contact makermanager (HTTP)"
                     log.error("Cannot contact makermanager (HTTP)")
 
-                except urllib2.URLError, e:
+                except urllib2.URLError:
                     errors += [ ERROR_NETWORK ]
-                    errors_source[ERROR_NETWORK] = "heartbeat.run(): Cannot contact makermanager (URL)"
+                    errors_source[ERROR_NETWORK] = "NetworkHeartbeatMonitor.run(): Cannot contact makermanager (URL)"
                     log.error("Cannot contact makermanager (URL)")
 
                 #
@@ -992,7 +1005,7 @@ class heartbeat(threading.Thread):
                         #
                         # no longer have errors, let everyone know !
                         #
-                        self.action_queue.put((INACTIVE, "heartbeat.run(): found network"))
+                        self.action_queue.put((INACTIVE, "NetworkHeartbeatMonitor.run(): found network"))
                     #
                     # no problems, lets check again in 30 seconds so as not to
                     # irritate the server too much
@@ -1014,18 +1027,18 @@ class heartbeat(threading.Thread):
 
 ################################################################################
 #
-#  The interlock
+#  The Interlock
 #
 ################################################################################
 
-class interlock(threading.Thread):
+class Interlock(threading.Thread):
     """ 
-    the is the main interlock class used to insure that people have permission
+    the is the main Interlock class used to insure that people have permission
     to use this tool
     """
     
     def __init__(self, interlock_config, error_log):
-        log = logging.getLogger("interlock.init")
+        log = logging.getLogger("Interlock.init")
         log.info("in __init__")
 
         #
@@ -1042,7 +1055,7 @@ class interlock(threading.Thread):
         try:
             self.timeout = int(interlock_config.get('timeout', 0))
         except ValueError:
-            log.error("timeout is; " + 
+            log.error("timeout is: " + 
                     interlock_config['timeout'] + 
                     " needs to be a float or int")
 
@@ -1076,9 +1089,9 @@ class interlock(threading.Thread):
         # process what to do when triggers occur
         #
         output_mapping = {
-            "digital":   digital_output,
-            "stdio":     stdio_output,
-            "lcd_p018":  lcd_p018_output,
+            "digital":   OutputDigital,
+            "stdio":     OutputStdio,
+            "lcd_p018":  OutputLcdP018,
             #
             # "audio":  audio_status_indicator
             #
@@ -1110,25 +1123,25 @@ class interlock(threading.Thread):
         # set up the tasks that read rfid badges
         #
         rfid_reader_mapping = {
-            "serial":       serial_rfid_reader,
-            "stdio":        keyboard_rfid_reader,
-            "input_event":  input_event_rfid_reader,
+            "serial":       BadgeReaderSerial,
+            "stdio":        BadgeReaderKeyboard,
+            "input_event":  BadgeReaderInputEvent,
         }
         self.rfid_readers = []
         rfid_configs = { 
                 connection: rfid_config 
                 for connection, rfid_config in interlock_config.items()
                 if type(rfid_config) == dict and 
-                    rfid_config.get('mode') == "rfid_reader" }
+                    rfid_config.get('mode') == "badge_reader" }
         for connection, rfid_config in rfid_configs.items():
             try:
                 reader = rfid_reader_mapping[rfid_config['type']](
                         rfid_config, connection, self.tool_id, self.query_url, self.action_queue)
                 reader.start()
                 self.rfid_readers.append(reader)
-                log.info("rfid_reader " + connection + " added")
+                log.info("badge_reader " + connection + " added")
             except:
-                log.error("rfid_reader " + connection + " could not be added")
+                log.error("badge_reader " + connection + " could not be added")
 
         #
         # set up the tasks that monitors input lines
@@ -1138,8 +1151,8 @@ class interlock(threading.Thread):
             # "serial":  serial_monitor,
             # "stdio":   stdio_monitor,
             #
-            "adc":     adc_monitor,
-            "digital": digital_monitor,
+            "adc":     MonitorAnalog,
+            "digital": MonitorDigital,
         }
         self.monitors = []
         monitor_configs = { 
@@ -1154,22 +1167,22 @@ class interlock(threading.Thread):
                 monitor.start()
                 self.monitors.append(monitor)
                 log.info("monitor " + connection + " added")
-            except KeyError, e:
-                log.error("monitor " + connection + " could not be added " + str(e))
+            except KeyError:
+                log.error("monitor " + connection + " could not be added")
 
         #
         # set up the task that monitors network connection and tool status
         #
-        self.heartbeat = heartbeat(self.query_url, self.action_queue)
-        self.heartbeat.start()
+        self.network_heartbeat = NetworkHeartbeatMonitor(self.query_url, self.action_queue)
+        self.network_heartbeat.start()
 
         #
         # the list of objects that receive update messages
         #
-        self.need_status_updates = self.outputs + self.rfid_readers + [ self.heartbeat ]
+        self.need_status_updates = self.outputs + self.rfid_readers + [ self.network_heartbeat ]
 
     def run(self):
-        log = logging.getLogger("interlock.run")
+        log = logging.getLogger("Interlock.run")
         log.debug("starting")
         #
         # equipment is not active, monitor the rfid reader and see if 
@@ -1193,7 +1206,7 @@ class interlock(threading.Thread):
             LOGIN_DENIED:      self.nothing,
         }
 
-        self.action_queue.put((INACTIVE, "interlock.run() initial power up"))
+        self.action_queue.put((INACTIVE, "Interlock.run() initial power up"))
 
         while True:
             log.debug("waiting on action_queue.get()")
@@ -1216,7 +1229,7 @@ class interlock(threading.Thread):
             update_me.update(ERROR_CONFIG)
 
     def active_mode(self):
-        log = logging.getLogger("interlock.run")
+        log = logging.getLogger("Interlock.run")
         log.debug("active_mode start")
 
         self.clear_all_timers()
@@ -1224,12 +1237,12 @@ class interlock(threading.Thread):
         self.timer_to_warning = threading.Timer(
                 self.timeout - self.warning_seconds,
                 lambda: self.action_queue.put(
-                    (INACTIVE_SOON, "interlock.active_mode()") ) )
+                    (INACTIVE_SOON, "Interlock.active_mode()") ) )
 
         # self.timer_to_deactivate = threading.Timer(
         #         self.timeout,
         #         lambda: self.action_queue.put(
-        #             (INACTIVE, "interlock.active_mode()") ) )
+        #             (INACTIVE, "Interlock.active_mode()") ) )
 
         log.debug("active_mode starting timers")
         self.timer_to_warning.start()
@@ -1238,10 +1251,10 @@ class interlock(threading.Thread):
 
 
     def warning_mode(self):
-        log = logging.getLogger("interlock.run")
+        log = logging.getLogger("Interlock.run")
         log.debug("warning_mode")
 
-        if self.timer_to_deactivate <> None and self.timer_to_warning == None:
+        if self.timer_to_deactivate != None and self.timer_to_warning == None:
             # 
             # already in warning mode
             # 
@@ -1251,52 +1264,47 @@ class interlock(threading.Thread):
             self.timer_to_deactivate = threading.Timer(
                     self.warning_seconds,
                     lambda: self.action_queue.put(
-                        (INACTIVE, "interlock.active_mode()") ) )
+                        (INACTIVE, "Interlock.active_mode()") ) )
             self.timer_to_deactivate.start()
 
     def inactive_mode(self):
-        log = logging.getLogger("interlock.run")
+        log = logging.getLogger("Interlock.run")
         log.debug("inactive_mode() called")
 
         self.clear_all_timers()
 
     def reset_timers(self):
-        log = logging.getLogger("interlock.run")
+        log = logging.getLogger("Interlock.run")
         log.debug("reset_timers called")
 
-        if self.timer_to_warning <> None or self.timer_to_deactivate <> None:
-            self.action_queue.put((ACTIVE, "interlock.reset_timers()"))
+        if self.timer_to_warning != None or self.timer_to_deactivate != None:
+            self.action_queue.put((ACTIVE, "Interlock.reset_timers()"))
 
     def error(self):
-        log = logging.getLogger("interlock.run")
+        log = logging.getLogger("Interlock.run")
         log.debug("errors called")
         self.clear_all_timers()
 
     def clear_all_timers(self):
-        if self.timer_to_warning <> None:
+        if self.timer_to_warning != None:
             self.timer_to_warning.cancel()
             self.timer_to_warning = None
-        if self.timer_to_deactivate <> None:
+        if self.timer_to_deactivate != None:
             self.timer_to_deactivate.cancel()
             self.timer_to_deactivate = None
 
-
-################################################################################
-#
-#  command line initiation
-#
-################################################################################
-
-if __name__ == "__main__":
+def run_from_commandline():
     lock_filename = "/var/lock/mother"
-    fp = open(lock_filename, "w+")
+    lock_file = open(lock_filename, "w+")
     try:
-        fcntl.lockf(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fp.truncate(0)
-        fp.write(str(os.getpid()))
+        fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.truncate(0)
+        lock_file.write(str(os.getpid()))
     except IOError:
         print "Another instance is still running"
         sys.exit(0)
+
+    # while True:
 
     config = configuration.read()
 
@@ -1314,7 +1322,7 @@ if __name__ == "__main__":
     #
     # let's do this thing
     #
-    interlock = interlock(config, error_log)
+    interlock = Interlock(config, error_log)
     if error_log.get_errors():
         print "here are the errors"
         for init_error in error_log.get_errors():
@@ -1324,3 +1332,24 @@ if __name__ == "__main__":
     else:
         time.sleep(2)
         interlock.start()
+
+    # while str(configuration.read()) = str(config):
+    #     time.sleep(1)
+
+    #
+    #  not working yet !!!!
+    #
+    # interlock.killall()
+    #
+    #  not working yet !!!!
+    #
+
+################################################################################
+#
+#  command line initiation
+#
+################################################################################
+
+if __name__ == "__main__":
+    run_from_commandline()
+
